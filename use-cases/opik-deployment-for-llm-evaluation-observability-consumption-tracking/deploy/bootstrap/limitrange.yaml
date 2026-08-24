@@ -1,0 +1,17 @@
+# required: ca-cert-injection sets no resources, ResourceQuota needs one
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: opik-container-defaults
+  namespace: opik
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+        ephemeral-storage: 128Mi
+      default:
+        cpu: 500m
+        memory: 1Gi
+        ephemeral-storage: 1Gi

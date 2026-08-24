@@ -1,0 +1,265 @@
+# Opik behind Traefik + cert-manager, on managed OVHcloud MySQL/Valkey/S3
+# ClickHouse runs in-cluster
+mysql:
+  enabled: false
+redis:
+  enabled: false
+minio:
+  enabled: false
+
+# in-cluster: migrations hard-code a ZooKeeper path and ON CLUSTER, both rejected by managed services
+clickhouse:
+  enabled: true
+  shardsCount: 1
+  replicasCount: 1
+
+  # required, or the namespace LimitRange default (500m/1Gi) applies
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 6Gi
+      ephemeral-storage: 4Gi
+
+  nodeSelector:
+    nodepool: np-workload
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: workload
+      effect: NoSchedule
+
+  storage: 30Gi
+  storageClassName: csi-cinder-high-speed-gen2
+
+  # bucketURL must be path-style
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+    bucketURL: "https://s3.gra.io.cloud.ovh.net/opik-clickhouse-backups"
+    secretName: opik-secrets
+    accessKey: AWS_ACCESS_KEY_ID
+    secretKey: AWS_SECRET_ACCESS_KEY
+    resources:
+      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 512Mi }
+    # -x dropped from the chart's default: it would leak S3 creds into the job logs
+    command:
+      - /bin/bash
+      - '-c'
+      - |-
+        set -e
+        export backupname=backup$(date +'%Y%m%d%H%M')
+        echo "BACKUP ALL EXCEPT DATABASE system TO S3('${CLICKHOUSE_BACKUP_BUCKET}/${backupname}/', '$ACCESS_KEY', '$SECRET_KEY');" > /tmp/backQuery.sql
+        echo "backing up $backupname to ${CLICKHOUSE_BACKUP_BUCKET}"
+        clickhouse-client -h clickhouse-opik-clickhouse --send_timeout 600000 --receive_timeout 600000 --port 9000 --queries-file=/tmp/backQuery.sql
+
+  adminUser:
+    username: opik
+    useSecret:
+      enabled: true
+    secretname: secrets
+    password_key: ANALYTICS_DB_PASS
+
+# single point of failure: a restart flips ClickHouse's Replicated tables read-only
+zookeeper:
+  enabled: true
+  replicaCount: 1
+  persistence:
+    enabled: true
+    size: 8Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+      ephemeral-storage: 1Gi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+      ephemeral-storage: 2Gi
+  nodeSelector:
+    nodepool: np-system
+
+altinity-clickhouse-operator:
+  enabled: true
+  nodeSelector:
+    nodepool: np-system
+  crdHook:
+    nodeSelector:
+      nodepool: np-system
+
+# only MySQL needs a private CA here - ClickHouse and Valkey use Let's Encrypt
+caCerts:
+  additionalCACerts:
+    - name: ovh-mysql
+      content: |
+        # paste your MySQL project CA here - see deploy/opik/ca-bundle.sh
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
+
+demoDataJob:
+  enabled: false
+chartMigration:
+  enabled: false
+
+component:
+  backend:
+    replicaCount: 1
+
+    nodeSelector:
+      nodepool: np-workload
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: workload
+        effect: NoSchedule
+
+    # memory limit is required - the JVM sizes itself off it via MaxRAMPercentage
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: 10Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+        ephemeral-storage: 15Gi
+
+    waitForMysql:
+      enabled: true
+      mysql:
+        host: <your-mysql-host>
+        port: <your-mysql-port>
+      resources:
+        requests: { cpu: 10m, memory: 32Mi, ephemeral-storage: 64Mi }
+        limits: { cpu: 100m, memory: 64Mi, ephemeral-storage: 128Mi }
+
+    run_migration_resources:
+      requests: { cpu: 250m, memory: 1Gi, ephemeral-storage: 1Gi }
+      limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 2Gi }
+
+    # Always on, no enabled flag. Loops on an HTTP 200, curl -k.
+    waitForClickhouse:
+      clickhouse:
+        host: clickhouse-opik-clickhouse
+        port: 8123
+        protocol: http
+      resources:
+        requests: { cpu: 10m, memory: 32Mi, ephemeral-storage: 64Mi }
+        limits: { cpu: 100m, memory: 64Mi, ephemeral-storage: 128Mi }
+
+    env:
+      STATE_DB_PROTOCOL: "jdbc:mysql://"
+      # required or both DBs stay silently empty - Liquibase's changelog
+      # table has no PK, which managed MySQL enforces.
+      STATE_DB_URL: "<your-mysql-host>:<your-mysql-port>/defaultdb?rewriteBatchedStatements=true&sslMode=VERIFY_IDENTITY&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true&sessionVariables=sql_require_primary_key=0"
+      STATE_DB_DATABASE_NAME: "defaultdb"
+      STATE_DB_USER: "avnadmin"
+
+      ANALYTICS_DB_PROTOCOL: "HTTP"
+      ANALYTICS_DB_HOST: "clickhouse-opik-clickhouse"
+      ANALYTICS_DB_PORT: "8123"
+      ANALYTICS_DB_DATABASE_NAME: "opik"
+      ANALYTICS_DB_USERNAME: "opik"
+      ANALYTICS_DB_MIGRATIONS_URL: "jdbc:clickhouse://clickhouse-opik-clickhouse:8123"
+      ANALYTICS_DB_MIGRATIONS_USER: "opik"
+
+      # Valkey isn't here - the single URL, credentials included, lives in the secret
+      S3_BUCKET: "opik-attachments"
+      S3_REGION: "gra"
+      S3_URL: "https://s3.gra.io.cloud.ovh.net"
+      OPIK_USAGE_REPORT_ENABLED: "false"
+
+    envFrom:
+      - configMapRef:
+          name: opik-backend
+      - secretRef:
+          name: opik-secrets
+
+  frontend:
+    replicaCount: 1
+
+    nodeSelector:
+      nodepool: np-workload
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: workload
+        effect: NoSchedule
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+        ephemeral-storage: 10Gi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: 15Gi
+
+    ingress:
+      enabled: false
+
+    extraServerHeaders:
+      X-Frame-Options: "DENY"
+      X-Content-Type-Options: "nosniff"
+      Referrer-Policy: "strict-origin-when-cross-origin"
+
+  python-backend:
+    replicaCount: 1
+
+    nodeSelector:
+      nodepool: np-sandbox
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: sandbox
+        effect: NoSchedule
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+        ephemeral-storage: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+        ephemeral-storage: 4Gi
+
+    securityContext:
+      privileged: false
+
+    # needs additionalRules, or the Redis client fails silently at startup
+    # managed IPs change on maintenance, re-check with:
+    #   kubectl get secret -n opik opik-secrets -o jsonpath='{.data.REDIS_URL}' \
+    #     | base64 -d | sed -E 's|.*@([^:]+):.*|\1|' | xargs dig +short
+    networkPolicy:
+      enabled: true
+      additionalRules:
+        - ports:
+            - port: 20185
+              protocol: TCP
+          to:
+            - ipBlock:
+                cidr: <your-python-backend-egress-ip>/32
+
+    env:
+      PYTHON_CODE_EXECUTOR_STRATEGY: "process"
+      PYTHON_CODE_EXECUTOR_PARALLEL_NUM: "5"
+      PYTHON_CODE_EXECUTOR_EXEC_TIMEOUT_IN_SECS: "3"
+      PYTHON_CODE_EXECUTOR_ALLOW_NETWORK: "false"
+      PYTHON_CODE_EXECUTOR_MEM_LIMIT: "256m"
+      PYTHON_CODE_EXECUTOR_CPU_SHARES: "512"
+      # update this if you rename the Helm release.
+      OPIK_URL_OVERRIDE: "http://opik-backend:8080"
+      OPIK_REVERSE_PROXY_URL: "http://opik-frontend:5173/api"
+
+    envFrom:
+      - configMapRef:
+          name: opik-python-backend
+      - secretRef:
+          name: opik-secrets
