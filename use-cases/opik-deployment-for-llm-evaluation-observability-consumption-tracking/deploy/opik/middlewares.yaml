@@ -1,0 +1,11 @@
+---
+# basic Auth in front of / and /api - self-hosted Opik authenticates nothing on its own
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-auth
+  namespace: opik
+spec:
+  basicAuth:
+    secret: opik-ui-auth
+    realm: "Opik"

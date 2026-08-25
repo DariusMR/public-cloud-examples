@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: opik-ui
+  namespace: opik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.middlewares: opik-basic-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: opik.<your-domain>      # replace <your-domain> with your actual domain name
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: opik-frontend
+                port:
+                  number: 5173
+  tls:
+    - hosts:
+        - opik.<your-domain>      # replace <your-domain> with your actual domain name
+      secretName: opik-tls

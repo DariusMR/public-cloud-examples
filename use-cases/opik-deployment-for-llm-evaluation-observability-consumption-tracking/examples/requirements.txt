@@ -1,0 +1,6 @@
+litellm<1.92
+opik
+openai
+python-dotenv
+pyyaml
+requests
